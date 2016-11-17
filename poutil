@@ -1,0 +1,277 @@
+#! /usr/bin/env tclsh
+proc slurp {fname} {
+	if {$fname == "-"} {
+		return [read stdin]
+	} else {
+		set f [open $fname]
+		set d [read $f]
+		close $f
+		return $d
+	}
+}
+
+# Turn po style strings into standard strings:
+proc pounescape {str} {
+	set str [regsub -lineanchor -all {^\s*"|"\s*$} $str {}]
+	set str [string map [list \n "" \\t \t \\n \n \\\" \" \\\\ \\] $str]
+}
+
+# Po file parser. Works like a foreach loop:
+proc poparse {fname id str cm script} {
+	upvar 1 $id msgid
+	upvar 1 $str msgstr
+	upvar 1 $cm comments
+	set buffer ""
+
+	foreach line [split [slurp $fname] \n] {
+		if [regexp {\S} $line] {
+			append buffer $line \n
+		} elseif {$buffer != ""} {
+			set txt [regsub -all -lineanchor {^#.*?^} $buffer {}]
+			set msgid ""
+			set msgstr ""
+			set comments ""
+			if {[regexp {\S} $txt]} {
+				regexp {msgid(.*)msgstr(.*)} $txt -> msgid msgstr
+				set comments [regexp -lineanchor -inline -all {^#.*?$} $buffer]
+				
+				uplevel 1 $script
+				set buffer ""
+			}
+		}
+	}
+}
+
+proc htmlunescape {str} {
+	regsub -all {<[a-z]+?.*?>} $str {}
+}
+
+proc varunescape {str} {
+	regsub -all {(^|\W)[!$%@?]\w+} $str {\1}
+}
+
+proc pocount {fname} {
+	set translated 0
+	set untranslated 0
+	set fuzzy 0
+	set foreign 0
+	poparse $fname msgid msgstr comments {
+		foreach {var str} [list idcount $msgid strcount $msgstr] {
+			set $var [regexp -all -nocase {\w+} [
+				varunescape [
+					htmlunescape [
+						pounescape $str
+					]
+				]
+			]]
+		}
+		
+		if {$strcount == 0} {
+			incr untranslated $idcount
+		} else {
+			incr translated $idcount
+		}
+		
+		if {[regexp fuzzy $comments]} {
+			incr fuzzy $idcount
+		}
+		
+		incr foreign $strcount
+	}
+	
+	puts "English word count: [expr $untranslated+$translated] ($untranslated untranslated) ($fuzzy fuzzy)"
+	puts "Foreign word count: $foreign"
+}
+
+proc pofind {fname condition {nocomments -comments}} {
+	poparse $fname msgid msgstr comments {
+		if $condition {
+			if {$nocomments == "-nocomments"} {
+				set comments ""
+			} else {
+				set comments "[join $comments \n]\n"
+			}
+			puts "${comments}msgid ${msgid}msgstr $msgstr"
+		}
+	}
+}
+
+proc pountranslated {fname {nocomments -comments}} {
+	pofind $fname {[pounescape $msgstr] == ""} $nocomments
+}
+
+proc pofuzzy {fname {nocomments -comments}} {
+	pofind $fname {[regexp fuzzy $comments]} $nocomments
+}
+
+proc posplit {fname {nfiles 2}} {
+	array set f {}
+	for {set x 0} {$x < $nfiles} {incr x} {
+		set f($x) [open [file rootname $fname]-[expr {$x+1}].po w]
+	}
+	set count 0
+	poparse $fname msgid msgstr comments {
+		set comments "[join $comments \n]\n"
+		puts $f($count) "${comments}msgid ${msgid}msgstr $msgstr"
+		set count [expr {($count+1) % $nfiles}]
+	}
+	foreach x [array names f] {
+		close $f($x)
+	}
+}
+
+proc pomerge {fname changesFile} {
+	array set changes {}
+	poparse $changesFile msgid msgstr comments {
+		set changes([string trim $msgid]) [list $msgstr $comments]
+	}
+	poparse $fname msgid msgstr comments {
+		set comments "[join $comments \n]\n"
+		set id [string trim $msgid]
+		if {[array get changes $id] != ""} {
+			puts "[join [lindex $changes($id) 1] \n]\nmsgid${msgid}msgstr[lindex $changes($id) 0]"
+		} else {
+			puts "${comments}msgid ${msgid}msgstr $msgstr"
+		}
+	}
+}
+
+proc pogrep {fname args} {
+	set operator "&&"
+	
+	if {[llength $args] == 1} {
+		set re [lindex $args 0]
+		set args [list -msgid $re -msgstr $re -comments $re]
+		set operator "||"
+	}
+	if {[llength $args]%2} {
+		error "Invalid syntax"
+	}
+	
+	set condition ""
+	
+	# condition compiler:
+	foreach {section re} $args {
+		set section [string trim $section -]
+		if {[regexp -- {-no} $section]} {
+			regexp {(.*)-} $section -> section
+			lappend condition " !\[regexp -- [list $re] \[pounescape \$$section\]\] "
+		} else {
+			lappend condition " \[regexp -- [list $re] \[pounescape \$$section\]\] "
+		}
+	}
+	set condition [join $condition $operator]
+	
+	if {[catch {pofind $fname $condition}]} {error "invalid syntax"}
+}
+
+proc ponocomments {fname} {
+	poparse $fname msgid msgstr comments {
+		puts "msgid ${msgid}msgstr $msgstr"
+	}
+}
+
+proc help {args} {
+puts {poutil - utilities for manipulating po files
+syntax: poutil <command> <?filename?> <?arguments...?>
+
+where filename is the po file you want to process. If the filename
+is "-" then it is read from stdin. This is useful if you want to use
+this program as a filter.
+
+And command is one of the following:
+
+help         - Prints this help message.
+
+count        - Count words in the po file.
+
+untranslated - Finds all untranslated messages.
+               optional argument: -nocomments  = filter out comments.
+
+fuzzy        - Finds all fuzzy messages.
+               optional argument: -nocomments  = filter out comments.
+
+nocomments   - Outputs the po file without comments.
+
+split        - Splits po files evenly into two or more files.
+               optional argument: number of files (defaults to 2)
+
+merge        - Merges changes into a PO file.
+               argument: file to merge.
+
+grep         - Finds all messages matching a regular expression.
+               either a single argument: a regexp
+               or: pairs of section_name and regexp
+               where section_name is one of the following:
+                   -msgid        = msgid matches the regexp
+                   -msgid-no     = msgid does not match the regexp
+                   -msgstr       = msgstr matches the regexp
+                   -msgstr-no    = msgstr does not match the regexp
+                   -comments     = comments match the regexp
+                   -comments-no  = comments do not match the regexp
+               more than one pair may be given.
+
+Examples:
+1. Find messages containing the word "foo":
+        poutil grep file.po foo
+
+2. Find messages where msgid contains the word "foo" which are not fuzzy:
+        poutil grep file.po -msgid foo -comments-no fuzzy
+
+3. Get all untranslated messages but omit comments:
+        poutil untranslated file.po -nocomments
+
+4. Get all untranslated messages where the msgid contains the word "foo":
+        poutil grep file.po -msgstr '^$' -msgid foo
+
+4b. Alternatively you can use 2 instances of poutil for this:
+        poutil untranslated file.po | poutil grep - -msgid foo
+
+5. Find all messages from the file "foo.html"
+        poutil grep file.po -comments foo.html
+}
+}
+
+# make this safe to source!
+if {!$tcl_interactive} {
+	set command [lindex $argv 0]
+	set arguments [lrange $argv 1 end]
+
+	proc run {cmd} {
+		if {[catch $cmd err]} {
+			puts stderr "Error - ${err}. Type \"poutil help\" to get help."
+			exit 1
+		}
+	}
+
+	switch -- $command {
+		help {
+				help
+			}
+		count {
+				run "pocount $arguments"
+			}
+		untranslated {
+				run "pountranslated $arguments"
+			}
+		fuzzy {
+				run "pofuzzy $arguments"
+			}
+		nocomments {
+				run "ponocomments $arguments"
+			}
+		grep {
+				run "pogrep $arguments"
+			}
+		split {
+				run "posplit $arguments"
+			}
+		merge {
+				run "pomerge $arguments"
+			}
+		default {
+				help
+			}
+	}
+
+}
